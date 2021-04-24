@@ -1,0 +1,546 @@
+---
+title: 'Predicting Bankruptcy: Dealing with Class Imbalance and Tuning for Optimal
+  Model Specification'
+author: "Mason Carhart"
+date: "3/26/2021"
+output:
+  prettydoc::html_pretty:
+    theme: jekyll-theme-slate
+    highlight: github
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+setwd("~/Jobs/Lithia/My_website")
+```
+
+```{r Loading Packages, echo = FALSE}
+
+library(pacman)
+p_load(tidymodels, tidyverse, janitor, skimr, magrittr, corrr, xgboost, cutpointr, ROSE, DT, plotly, readr, here)
+
+```
+
+## Project Overview:
+
+In the realm of dealing with risk when choosing whether to invest or to partner with another firm, having the ability to accurately determine whether the firm will go bankrupt or not is invaluable. Doing so however is difficult for a human to do alone, and machine learning can help make this prediction task feasible. Three separate models are tested and compared: Logistic Elastic-net, Boosted Forest, and SVM. This project focuses on 3 main tasks:
+  
+- Preparing the data
+  
+  * Correcting Class Imbalance
+    
+  * Feature Engineering and Normalization
+    
+- Model Tuning 
+  
+  * Grid Specification
+    
+  * Cross-Validation
+    
+- Model Selection and Defining Success 
+  
+  * Performance Measure Selection
+    
+  * Reasoning for Selected Model
+    
+
+```{r Loading Data, echo = FALSE, message = FALSE, error = FALSE}
+# Load in the data and clean names
+bank_df <- read_csv("data_csv.csv") %>% clean_names() 
+```
+
+## The Data:
+
+The data for this project comes from [kaggle](https://www.kaggle.com/fedesoriano/company-bankruptcy-prediction), and is composed of 6819 companies over the period of 1999 to 2009 in Taiwan. The dependent variable 'bankrupt' is a binary variable, with 1 meaning the company went bankrupt and 0 meaning the company did not go bankrupt. There are 95 independent variables ranging from 'return on assets' to 'cash flow rate'. 
+```{r Data Pane, echo = FALSE, message = FALSE, error = FALSE, warning = FALSE}
+DT::datatable(bank_df, class = "stripe", options = list(
+  autoWidth = TRUE,
+  scrollX = TRUE))
+```
+
+These variables are associated with a company's bankruptcy status, with some such as 'debt ratio percent' being positively correlated with bankruptcy whereas others such as 'net income to total assets' being negatively correlated.
+
+```{r Correlation Plots, message = FALSE, error = FALSE, warning = FALSE, fig.show="hold", out.width="50%"}
+# Grabbing Largest positive and negative correlations with bankrupt
+pos_correlations <- bank_df %>% correlate() %>% focus(bankrupt) %>% filter((bankrupt > .15)) %>% arrange(bankrupt)
+neg_correlations <- bank_df %>% correlate() %>% focus(bankrupt) %>% filter((bankrupt < -.20)) %>% arrange(bankrupt)
+
+# Creating ggplot for positive correlations
+pos_plot <- ggplot(pos_correlations, aes(x = bankrupt, y = reorder(term, bankrupt))) +
+  geom_col(aes(fill = bankrupt)) +
+  scale_fill_gradient2(midpoint = .115, low = "blue", mid='blue', high='green') +
+  theme_minimal() +
+  labs(title = "Positive Correlations With Bankrupt", y = "Term", x = "Correlation Value") +
+  theme(legend.position = "none")
+
+# Creating ggplot for negative correlations
+neg_plot <- ggplot(neg_correlations, aes(x = bankrupt, y = reorder(term, bankrupt))) +
+  geom_col(aes(fill = bankrupt)) + 
+  scale_fill_gradient2(midpoint = -.18, low = "red", mid='purple', high='blue') +
+  theme_minimal() +
+  labs(title = "Negative Correlations With Bankrupt", y = "Term", x = "Correlation Value") +
+  theme(legend.position = "none")
+
+ggplotly(pos_plot)
+ggplotly(neg_plot)
+```
+  
+## Data Preparation:
+
+### Splitting the data
+First the data is split into training and testing datasets. The split is made with 80% of the data being allotted to training and 20% to testing. *Note: The outcome variable is turned into a factor for classification task.*
+```{r Splitting Data, message = FALSE, error = FALSE, warning = FALSE}
+# Set the seed 
+set.seed(11803)
+# Outcome as factor
+bank_df %<>% mutate(bankrupt = as.factor(bankrupt))
+# Creating train/test split
+initial_split_np <- bank_df  %>% initial_split(prop = .8)
+# Creating training and test
+train_np <- initial_split_np %>% training()
+test_np <- initial_split_np %>% testing()
+
+```
+
+### Checking for class imbalance:
+
+For classification tasks, the balance between the null outcome and the target outcome (in this case bankruptcy) is important as for imbalance can cause poor prediction performance. In the training dataset, there are around 29 non-bankrupt observations per 1 bankrupt observation.
+
+```{r Showing Imbalance, message = FALSE, error = FALSE, warning = FALSE}
+# Showing class imbalance pre over/under sampling
+train_np %>% group_by(bankrupt) %>% count() %>% tibble() 
+```
+
+Showing class imbalance graphically:
+```{r Plotting Class Imbalance, message = FALSE, error = FALSE, warning = FALSE}
+# Creating plot of class imbalance
+pre_sample_plot <- ggplot(train_np, aes(x = net_income_to_total_assets, y = debt_ratio_percent)) +
+  geom_point(aes(color = bankrupt), alpha = .5) +
+  geom_density_2d(color = "grey", alpha = .75) +
+  scale_color_viridis_d(option = "C") +
+  labs(title = "Class Imbalance Prior Under/Over Sampling", color = "Bankrupt") +
+  theme_minimal()
+
+# Showing plot
+ggplotly(pre_sample_plot)
+```
+
+### Correcting for Class Imbalance
+
+There are a variety of ways to correct for class imbalance, with the gold standard being to collect more data. That is not possible in this setting, so oversampling of the minority class and majority class can be done to create a balanced class distribution. *Note: Testing dataset is untouched, so models can be validated with non-synthetic observations*
+
+```{r Over/Under Sampling, message = FALSE, error = FALSE, warning = FALSE}
+# Over and undersampling both classes in training dataset
+train_np <- ovun.sample(bankrupt ~ ., data = train_np, method = "both",
+           N = 5456, p = 0.3, seed = 1)$data
+
+
+```
+
+Looking at the class balance post resampling:
+
+```{r Showing New Balance, message = FALSE, error = FALSE, warning = FALSE}
+# SHowing class balance post over/under sampling
+train_np %>% group_by(bankrupt) %>% count() %>% tibble()
+```
+```{r Plotting New CLass Balance, message = FALSE, error = FALSE, warning = FALSE}
+# Creating plot of class imbalance post over/under sampling
+post_sample_plot <- ggplot(train_np, aes(x = net_income_to_total_assets, y = debt_ratio_percent)) +
+  geom_point(aes(color = bankrupt), alpha = .5) +
+  geom_density_2d(color = "grey", alpha = .75) +
+  scale_color_viridis_d(option = "C") +
+  labs(title = "Class Imbalance Post Under/Over sampling", color = "Bankrupt") +
+  theme_minimal()
+
+# Showing plot
+ggplotly(post_sample_plot)
+```
+  
+Looking at the graph, now there is a larger portion of target observations that will allow for the models separate the two classes for classification.
+
+### Feature Engineering
+
+For these models, interaction terms and polynomials are created from the variables with the strongest correlations with the dependent variable. Near zero variance and correlation filters are also applied to remove variables which provide little variation for prediction, and to remove variables that have high correlation with other variables.
+
+```{r Recipe Creation, message = FALSE, error = FALSE, warning = FALSE}
+
+# Creating recipe for non-parametric model
+recipe_np <- train_np %>% recipe(bankrupt ~ .)
+
+clean_recipe_np <- recipe_np %>% 
+  
+  #Creating Interactions
+  step_interact(~current_liability_to_assets:debt_ratio_percent) %>%
+  step_interact(~borrowing_dependency:debt_ratio_percent) %>%
+  step_interact(~starts_with("roa_")^3) %>%
+  step_interact(~matches("liability")^2) %>%
+  step_interact(~matches("net")^2) %>%
+  step_interact(~matches("income")^2) %>%
+  
+   # Creating polynomials
+  step_poly(debt_ratio_percent, degree = 2) %>% 
+  step_poly(starts_with("roa_"), degree = 2) %>%
+  
+  # Linear Combination filter
+  step_lincomb(all_predictors()) %>% 
+  
+  # Remove zero variance variables
+  step_nzv(all_predictors(), freq_cut = 150/5, unique_cut = 30) %>% 
+  
+  # Remove zero variance variables
+  step_zv(all_predictors()) %>% 
+  
+  # Remove highly correlated variables
+  step_corr(all_predictors()) %>% 
+  
+  # Normalize predictors
+  step_normalize(all_predictors()) 
+
+```
+
+### Creating Folds for Cross-Validation
+
+The training data is split into 5 folds randomly.
+
+```{r Creating CV Folds, message = FALSE, error = FALSE, warning = FALSE}
+set.seed(11803)
+# Create Cross Validation Folds
+train_np_cv <- train_np %>% vfold_cv(v = 5)
+```
+
+## Model Specification and Tuning:
+
+### Model Specification
+
+The specification for the logistic elastic-net is comprised of two hyperparameters to tune: penalty and mixture.
+  
+- Penalty $\lambda$: How much large coefficients are penalized.
+  
+- Mixture $\alpha$: Combination of L1 and L2 Penalization. L1 is lasso penalization (absolute value of coefficients). L2 is ridge penalization (Squared value of coefficients).
+  
+```{r Logistic Elastic-Net Specification, message = FALSE, error = FALSE, warning = FALSE}
+# Logistic Elastic-Net Specification
+logit_en <- logistic_reg(mode = "classification", penalty = tune(), mixture = tune()) %>% 
+  set_engine("glmnet")
+```
+
+
+For the boosted trees specification, there are three separate hyperparameters to tune: number of trees, learn rate, and tree depth.
+  
+- Number of Trees $M$: The number of trees to be created.
+  
+- Learning Rate $\lambda$: The value for how much say each tree has in the model.
+  
+- Tree Depth $J$: The maximum depth for each tree (number of branches).
+  
+```{r Boosted Trees Specification, message = FALSE, error = FALSE, warning = FALSE}
+
+boosted <- boost_tree(mode = "classification", trees = tune(),
+                      learn_rate = tune(), tree_depth = tune()) %>% 
+  set_engine(engine = "xgboost", splitrule = "gini")
+```
+
+Lastly for the support vector machine specification, it is a radial kernel based model. For a radial based model there are two hyperparameters to tune: rbf sigma and cost.
+  
+- RBF Sigma $\sigma$: Determines the reach of each observation when creating margin.
+  
+- Cost $C$: The 'budget' for allowing misclassifications and observations within the decision margin.
+  
+```{r Support Vector Machine Specification, message = FALSE, error = FALSE, warning = FALSE}
+svm_rad <- svm_rbf(mode = "classification", rbf_sigma = tune(),
+                  cost = tune()) %>% 
+  set_engine(engine = "kernlab")
+
+```
+
+
+### Generating workflows
+
+`Tidymodels` works by defining the data preprocessing and feature engineering steps in a recipe, and then adding the model specification and recipe to a workflow. 
+```{r Model Workflows, message = FALSE, error = FALSE, warning = FALSE}
+
+# Logistic elastic-net workflow
+log_en_wf <- workflow() %>% 
+  add_recipe(recipe_np) %>% 
+  add_model(logit_en)
+
+# Boosted trees workflow
+boosted_wf <- workflow() %>% 
+  add_recipe(recipe_np) %>% 
+  add_model(boosted)
+
+# Support vector machine workflow
+svm_wf <- workflow() %>% 
+  add_recipe(recipe_np) %>% 
+  add_model(svm_rad)
+
+```
+
+## Model Tuning:
+### Logistic Elastic-Net
+The tuning parameters tested for the logistic elastic-net are a penalty between 0 and .25, and a mixture between 0 and 1.
+```{r Cross Validation Logit EN, message = FALSE, error = FALSE, warning = FALSE}
+# Specifying tuning grid
+log_en_grid <- expand_grid(
+  penalty = seq(0, .25, .01),
+  mixture = seq(0, 1, .1)
+)
+
+# Tuning logistic elastic-net
+log_en_cv <- log_en_wf %>% 
+  tune_grid(
+    train_np_cv,
+    grid = log_en_grid,
+    metrics = metric_set(yardstick::accuracy)
+  )
+```
+
+Looking at the tuning results for the logistic elastic-net, the best model specification comprised a L1 penalty component (ridge) with a very small penalty. This suggests that a flexible model with high variance is preferred in this application.
+```{r logistic EN tuning results, message = FALSE, error = FALSE, warning = FALSE}
+# Displaying tuning results for logistic elastic-net
+log_en_tune_plot <- log_en_cv %>% 
+    collect_metrics() %>%
+    mutate(mixture = as.factor(mixture),
+           max = log_en_cv %>% collect_metrics() %>% 
+             filter(mean == max(mean)) %>% select(penalty) %>% pull()) %>% 
+    ggplot(aes(x = penalty, y = mean, color = mixture)) +
+    geom_line(size = 0.7, alpha = 0.6) +
+    geom_point(size = 2.5) +
+    scale_x_continuous("Penalty (Lambda)", labels = scales::label_number()) +
+    scale_y_continuous("Accuracy") +
+    scale_color_viridis_d("Mixture", option = 'A') +
+    geom_vline(aes(xintercept = max), size = 2, alpha = .3, color = "green") +
+    theme_minimal() + 
+    theme(legend.position = "bottom") +
+    labs(title = "Tuning Results for Logistic Elastic-Net")
+
+ggplotly(log_en_tune_plot)
+```
+  
+### Boosted Trees
+The tuning grid for the boosted trees includes several sequences of values to test: number of trees between 200 and 1000 are tested, tree depths of 4 through 8 are tested, and the values for learn rate tested are between .01 and .1.
+```{r Cross Validation Boosted, message = FALSE, error = FALSE, warning = FALSE}
+# Specifying tuning grid
+boost_grid <- expand_grid(
+  trees = seq(200, 1000, 100),
+  tree_depth = seq(4, 8, 1),
+  learn_rate = seq(.04, .1, .03)
+)
+
+# Tuning boosted trees
+boosted_cv <- boosted_wf %>% 
+  tune_grid(
+    train_np_cv,
+    grid = boost_grid, 
+    metrics = metric_set(yardstick::accuracy)
+  )
+```
+
+The tuning results for the boosted trees show that the optimal number of trees is 700, with a learning rate of .1 and a tree depth of 4.
+```{r Boosted Trees Tuning Results, message = FALSE, error = FALSE, warning = FALSE}
+# Displaying tuning results for boosted trees
+boosted_tree_tune_plot <- boosted_cv %>% 
+      collect_metrics() %>% 
+      select(trees, tree_depth, learn_rate, mean) %>% 
+      mutate(mean = as.numeric(mean),
+             tree_depth = as.factor(tree_depth), 
+             learn_rate = as.factor(learn_rate),
+             max = (boosted_cv %>% collect_metrics() %>% 
+                      filter(mean == max(mean)) %>% select(trees) %>% pull() %>% .[1])) %>% 
+      ggplot(aes(x = trees)) +
+      geom_line(aes(y = mean , color = tree_depth, alpha = learn_rate), size = .7) +
+      geom_point(aes(y = mean , color = tree_depth, alpha = learn_rate), size = 2.5) +
+      scale_color_viridis_d(option = "A") +
+      geom_vline(aes(xintercept = max), size = 2, alpha = .3, color = "green") +
+      theme_minimal() +
+      labs(x = "Number of Trees", y = "Accuracy", title = "Tuning Results for Boosted Trees", alpha = "Learn Rate", color = "Tree Depth") 
+
+ggplotly(boosted_tree_tune_plot)
+```
+  
+### Support Vector Machine
+For the support vector machine, only two hyperparemeter sets are tested: cost with values between -3 and 2, and sigma with values between -4 and -2.
+```{r Cross Validating SVM, message = FALSE, error = FALSE, warning = FALSE}
+# Specifying tuning grid
+svm_grid <- expand_grid(
+  cost = 10^seq(-4, 2, 1),
+  rbf_sigma = 10^seq(-8, -4, 1)
+)
+
+# Tuning support vector machine
+svm_cv <- svm_wf %>% 
+  tune_grid(
+    train_np_cv,
+    grid = svm_grid,
+    metrics = metric_set(yardstick::accuracy)
+  )
+
+
+```
+The tuning results for the SVM show that a cost value of 0 and an rbf sigma  value of .00001 are optimal.
+```{r Support Vector Machine Tuning Results, message = FALSE, error = FALSE, warning = FALSE}
+# Displaying tuning results for logistic elastic-net
+svm_tune_plot <- svm_cv %>% 
+    collect_metrics() %>%
+    mutate(rbf_sigma = as.factor(rbf_sigma),
+           max = svm_cv %>% collect_metrics() %>% 
+             filter(mean == max(mean)) %>% select(cost) %>% pull() %>% .[1]) %>% 
+    ggplot(aes(x = cost, y = mean, color = rbf_sigma)) +
+    scale_x_log10() +
+    geom_line(size = 0.7, alpha = 0.6) +
+    geom_point(size = 2.5) +
+    scale_x_continuous("Cost", labels = scales::label_number()) +
+    scale_y_continuous("Accuracy") +
+    scale_color_viridis_d("RBF Sigma", option = 'C') +
+    geom_vline(aes(xintercept = max), size = 2, alpha = .3, color = "green") +
+    theme_minimal() + 
+    theme(legend.position = "bottom") +
+    labs(title = "Tuning Results for Support Vector Machine")
+
+ggplotly(svm_tune_plot)
+```
+
+
+## Model Performance Evaluation:
+### Logistic Elastic-Net
+  
+The logistic elastic-net performs well, having a rather high sensitivity while also maintaining an high accuracy.
+```{r Final Fit and Prediction for Logistic Elastic Net, message = FALSE, error = FALSE, warning = FALSE}
+# Fitting best logistic elastic-net to entire training dataset
+logit_fit <- log_en_wf %>% 
+  finalize_workflow(select_best(log_en_cv, metric = "accuracy")) %>% 
+  fit(train_np)
+
+# Creating predictions on test dataset
+y_hat_en <- logit_fit %>% predict(new_data = test_np, type = "prob") %>% 
+  tibble() %>% mutate(estimate = ifelse(.pred_1 >= .5, 1, 0),
+                      truth = as.factor(test_np$bankrupt))
+
+# Creating confidence matrix
+conf_mat(
+  data = tibble(
+    y_hat_en = y_hat_en$estimate %>% as.factor(),
+    truth = test_np$bankrupt
+  ),
+  truth = truth,
+  estimate = y_hat_en
+)
+
+```
+### Boosted Trees
+For the boosted trees model, it maintains a very high accuracy while also having a decent level of sensitivity.
+```{r Final Fit and Prediction for SVM, message = FALSE, error = FALSE, warning = FALSE}
+# Fitting best support vector machine to entire training dataset
+boosted_fit <- boosted_wf %>% 
+  finalize_workflow(select_best(boosted_cv, metric = "accuracy")) %>% 
+  fit(train_np)
+
+# Creating predictions on test dataset
+y_hat_boost <- boosted_fit %>% predict(new_data = test_np, type = "prob") %>% 
+  tibble() %>% mutate(estimate = ifelse(.pred_1 > .5, 1, 0),
+                      truth = as.factor(test_np$bankrupt))
+
+
+# Creating confidence matrix
+conf_mat(
+  data = tibble(
+    y_hat = y_hat_boost$estimate %>% as.factor(),
+    truth = y_hat_boost$truth
+  ),
+  truth = truth,
+  estimate = y_hat
+)
+
+```
+### Support Vector Machine
+For the support vector machine, while it has a high accuracy, its sensitivity is 0%, struggling to classify bankrupt observations.
+```{r Final Fit and Prediction for Boosted, message = FALSE, error = FALSE, warning = FALSE}
+# Fitting best support vector machine to entire training dataset
+svm_fit <- svm_wf %>% 
+  finalize_workflow(select_best(svm_cv, metric = "accuracy")) %>% 
+  fit(train_np)
+
+# Creating predictions on test dataset
+y_hat_svm <- svm_fit %>% predict(new_data = test_np, type = "prob") %>% 
+  tibble() %>% mutate(estimate = ifelse(.pred_1 > .0005, 1, 0),
+                      truth = as.factor(test_np$bankrupt)) 
+y_hat_svm_class <- svm_fit %>% predict(new_data = test_np, type = "class") %>% 
+  tibble() %>% mutate(estimate = .pred_class,
+                      truth = as.factor(test_np$bankrupt)) 
+
+# Creating Confidence matrix
+conf_mat(
+  data = tibble(
+    y_hat = y_hat_svm_class$estimate %>% as.factor(),
+    truth = y_hat_svm_class$truth
+  ),
+  truth = truth,
+  estimate = y_hat
+)
+
+```
+
+## ROC Curve and AUC Comparison:
+
+Clearly, even with using over and undersampling to deal with class imbalance, the support vector machine performed poorly. This is likely due to observations between each class being too similar in variable values, preventing the SVM from creating an effective separating hyperplane. The logistic elastic-net and boosted trees performed similarly, with the elastic-net having higher sensitivity whereas the boosted trees has higher accuracy, Depending on whether correctly predicting a company accurately or correctly predicting bankrupt companies is more important, this is where one of these models should be preferred to the other.
+```{r ROC Curves, message = FALSE, error = FALSE, warning = FALSE, fig.show="hold", out.width="50%"}
+# Creating ROC curve for logistic elastic-net
+roc_en <- roc_curve(y_hat_en, truth, .pred_1, event_level = "second") %>% 
+  mutate(model = "Elastic-Net")
+
+# Creating ROC curve for boosted trees
+roc_boost <- roc_curve(y_hat_boost, truth, .pred_1, event_level = "second") %>% 
+  mutate(model = "Boosted Trees")
+
+# Creating ROC curve for support vector machine
+roc_svm <- roc_curve(y_hat_svm, truth, .pred_1, event_level = "second") %>% 
+  mutate(model = "Support Vector Machine")
+
+# Creating ROC Comparison tibble
+roc_all <- rbind(roc_en, roc_boost, roc_svm)
+
+# Obtaining AUC value for logistic elastic-net
+auc_en <- roc_auc(y_hat_en, truth, .pred_1, event_level = "second") %>% 
+  mutate(model = "Elastic-Net")
+
+# Obtaining AUC value for boosted trees
+auc_boost <- roc_auc(y_hat_boost, truth, .pred_1, event_level = "second") %>% 
+  mutate(model = "Boosted Trees")
+
+# Obtaining AUC value for support vector machine
+auc_svm <- roc_auc(y_hat_svm, truth, .pred_1, event_level = "second") %>% 
+  mutate(model = "Support Vector Machine")
+
+# Creating AUC comparison table
+auc_all <- rbind(auc_en, auc_boost, auc_svm)
+
+# Plotting ROC curves together
+roc_comp_plot <- ggplot(roc_all, aes(x = (1-specificity), y = sensitivity)) +
+  geom_path(aes(color = model), size = 1.25) +
+  geom_abline(lty = 3, size = .75) +
+  geom_area(aes(fill = model),
+              alpha = 0.1, position = 'identity', show.legend = FALSE) +
+  scale_color_viridis_d(option = "D") +
+  scale_fill_viridis_d(option = "D") +
+  theme_minimal() +
+  labs(title = "Model Performance Comparison: ROC Curves", x = "1 - Specificity", y = "Sensitivity", color = "Model")
+
+auc_comp_plot <- ggplot(auc_all, aes(x = model, y = .estimate)) +
+  geom_col(aes(fill = model)) +
+  scale_fill_viridis_d(option = "D") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Model Performance Comparison: AUC Values", x = "Model", y = "AUC")
+
+ggplotly(roc_comp_plot)
+ggplotly(auc_comp_plot)
+```
+  
+## Implications:
+For this prediction problem, class imbalance creates difficulty in correctly classifying bankrupt companies. While over and undersampling helps the boosted trees and elastic-net models learn bankrupt observations, the support vector machine is still unable to find a good decision boundary, and just predicts the null class. For this prediction application, the logistic elastic-net or boosted trees are strong choices. Choosing one over the other will depend upon how important accuracy is vs sensitivity. If this application is for risk analysis, the logistic elastic-net may be the correct model. 
+
+
